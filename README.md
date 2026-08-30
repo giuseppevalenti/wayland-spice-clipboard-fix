@@ -1,0 +1,1 @@
+# wayland-spice-clipboard-fix
