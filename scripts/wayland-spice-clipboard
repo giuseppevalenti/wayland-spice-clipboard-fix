@@ -1,0 +1,109 @@
+#!/bin/bash
+# Bridge between the Wayland clipboard and the X11 selection, because
+# spice-vdagent only reads the X11 one and the compositor will not expose it
+# while the active window is not an X11 window.
+
+set -u
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+
+XWAYLAND_WAIT="${XWAYLAND_WAIT:-60}"
+
+log() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
+
+# Display and authority must be taken as a pair from the Xwayland command line,
+# which is the value declared by whoever started the X server. Guessing among
+# the xauth_* files picks the wrong one when two sessions are open, or when a
+# stale file is left over from a previous session.
+#
+# /proc/PID/cmdline separates arguments with NUL, so they are read into an array
+# without any splitting on whitespace: paths containing spaces stay intact and
+# nothing is ever interpreted by the shell.
+read_xwayland_pair() {
+    local pid args display auth i
+    for pid in $(pgrep -x Xwayland -u "$(id -u)" 2>/dev/null); do
+        mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || continue
+        display=""
+        auth=""
+        for ((i = 0; i < ${#args[@]}; i++)); do
+            case "${args[i]}" in
+                -auth)
+                    auth="${args[i + 1]:-}"
+                    ;;
+                :[0-9]*)
+                    # only an actual display, not any argument starting with a colon
+                    [[ -z "$display" && "${args[i]}" =~ ^:[0-9]+$ ]] && display="${args[i]}"
+                    ;;
+            esac
+        done
+        [ -n "$display" ] && printf '%s\t%s\n' "$display" "$auth"
+    done
+}
+
+# A pair only counts if the X server actually answers with it. `xclip -version`
+# prints a version string without connecting, so it proves nothing.
+pair_works() {
+    DISPLAY="$1" XAUTHORITY="$2" xset q >/dev/null 2>&1
+}
+
+resolve_x11() {
+    local display auth
+
+    while IFS=$'\t' read -r display auth; do
+        [ -n "$display" ] || continue
+        if [ -n "$auth" ] && pair_works "$display" "$auth"; then
+            export DISPLAY="$display" XAUTHORITY="$auth"
+            return 0
+        fi
+    done < <(read_xwayland_pair)
+
+    # Fallback: try plausible combinations. They must be tried as pairs, since a
+    # valid display with the wrong authority fails and would be wrongly discarded.
+    for display in "${DISPLAY:-}" :0 :1 :2 :10; do
+        [ -n "$display" ] || continue
+        for auth in "${XAUTHORITY:-}" "$XDG_RUNTIME_DIR"/xauth_* "$HOME/.Xauthority"; do
+            [ -f "$auth" ] || continue
+            if pair_works "$display" "$auth"; then
+                export DISPLAY="$display" XAUTHORITY="$auth"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+# graphical-session.target does not guarantee Xwayland is already listening.
+# Without waiting, the service exits with an error and systemd restarts it every
+# few seconds until it appears, filling the journal on every login.
+waited=0
+until resolve_x11; do
+    if [ "$waited" -ge "$XWAYLAND_WAIT" ]; then
+        err "No X server reachable after ${XWAYLAND_WAIT}s."
+        err "  Xwayland processes: $(pgrep -c -x Xwayland 2>/dev/null || echo 0)"
+        err "  DISPLAY=${DISPLAY:-unset} XAUTHORITY=${XAUTHORITY:-none}"
+        exit 1
+    fi
+    [ "$waited" -eq 0 ] && log "Waiting for Xwayland..."
+    sleep 2
+    waited=$((waited + 2))
+done
+
+log "Display:    $DISPLAY"
+log "Xauthority: $XAUTHORITY"
+log "Clipboard bridge started"
+
+# Writing to X11 makes the compositor propagate the change back to Wayland,
+# which wakes --watch a second time. Without comparing against what is already
+# there, the bridge would chase its own writes. Only the byte count is logged:
+# clipboard content may hold passwords or tokens and never reaches the journal.
+exec wl-paste --type text --watch bash -c '
+    new=$(cat)
+    [ -n "$new" ] || exit 0
+    current=$(xclip -o -selection clipboard 2>/dev/null || true)
+    [ "$new" = "$current" ] && exit 0
+    printf %s "$new" | xclip -selection clipboard -i
+    printf "Synced %s chars\n" "$(printf %s "$new" | wc -c)"
+'
